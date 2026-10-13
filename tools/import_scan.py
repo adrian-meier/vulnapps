@@ -665,6 +665,43 @@ def _enforce_chain_flag(result: dict) -> None:
             f["matched_vuln_db_id"] = None
 
 
+# The finding fields of SYSTEM_PROMPT_EXTRACT's answer; --findings-json takes
+# a list in exactly this shape.
+FINDING_STR_FIELDS = ("vuln_type", "title", "http_method", "url", "parameter", "filename",
+                      "severity", "description", "poc", "remediation", "code_location")
+SEVERITIES = ("critical", "high", "medium", "low", "info")
+
+
+def load_findings_json(path: str) -> list[dict]:
+    """Read and check a --findings-json file. Raises ValueError naming the
+    first bad entry. Unknown keys are refused, not dropped, so a misspelt
+    field cannot vanish without a trace."""
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValueError(f"cannot read {path}: {e}") from None
+    if not isinstance(data, list):
+        raise ValueError(f"{path}: want a JSON list of findings, got {type(data).__name__}")
+    allowed = set(FINDING_STR_FIELDS) | {"is_false_positive"}
+    for i, f in enumerate(data):
+        where = f"{path}: finding {i}"
+        if not isinstance(f, dict):
+            raise ValueError(f"{where}: want an object, got {type(f).__name__}")
+        unknown = sorted(set(f) - allowed)
+        if unknown:
+            raise ValueError(f"{where}: unknown field(s) {unknown}; allowed: {sorted(allowed)}")
+        for k in FINDING_STR_FIELDS:
+            if k in f and not isinstance(f[k], str):
+                raise ValueError(f"{where}: {k} must be a string")
+        if not f.get("title", "").strip():
+            raise ValueError(f"{where}: title is required")
+        if f.get("severity") and f["severity"] not in SEVERITIES:
+            raise ValueError(f"{where}: severity {f['severity']!r} is not one of {list(SEVERITIES)}")
+        if not isinstance(f.get("is_false_positive", False), bool):
+            raise ValueError(f"{where}: is_false_positive must be true or false")
+    return data
+
+
 def _extract_json_text(text: str) -> str:
     """Pull the JSON object out of a raw LLM response.
 
@@ -1874,8 +1911,11 @@ def _matcher_identity(args) -> tuple:
 def _scan_config(args, scan_model: str | None) -> dict:
     """Provenance + configuration fingerprint fields to send with the scan."""
     matcher_version, matcher_sha = _matcher_identity(args)
-    extractor_version, extractor_sha = _llm_identity(
-        "cli" if args.use_cli else "api", args.extract_model, SYSTEM_PROMPT_EXTRACT)
+    if getattr(args, "findings_json", None):
+        extractor_version, extractor_sha = "structured", None
+    else:
+        extractor_version, extractor_sha = _llm_identity(
+            "cli" if args.use_cli else "api", args.extract_model, SYSTEM_PROMPT_EXTRACT)
     return {
         **_importer_identity(),
         "extractor_version": extractor_version,
@@ -1930,6 +1970,7 @@ def show_pretty_help():
     {c}--dir{r} {d}<path>{r}               Directory containing .md scan files
     {c}--file{r} {d}<path>{r}              Single .md file
     {c}--probely{r} {d}<ids>{r}            Probely scan ID(s), comma-separated (max 2)
+    {c}--findings-json{r} {d}<path>{r}     JSON list of findings; skips LLM extraction, needs {d}--scanner{r}
 
   {b}Connection:{r}
     {c}--url{r} {d}<url>{r}                Vulnapps URL (default: $VULNAPPS_URL)
@@ -2050,6 +2091,8 @@ def main():
                              'team (id or name; auto-promotes visibility to "team" if set).')
     parser.add_argument("--dir", default=None, help="Directory with .md scan result files")
     parser.add_argument("--file", help="Single .md file to import (instead of --dir)")
+    parser.add_argument("--findings-json", metavar="FILE",
+                        help="JSON list of findings in the extraction shape; skips LLM extraction. Needs --scanner.")
     parser.add_argument("--probely", default=None, help="Import from Probely: scan ID(s), comma-separated (max 2). Requires PROBELY_API_KEY env var.")
     parser.add_argument("--scanner", default=None, help="Scanner name (overrides LLM-detected name)")
     parser.add_argument("--scanner-version", default=None, help="Scanner version, e.g. '2.14.0'")
@@ -2180,9 +2223,21 @@ def main():
         ok = _upload_scan_state(client, args.upload_state_for, state_root)
         sys.exit(0 if ok else 1)
 
-    if not args.dir and not args.file and not args.probely:
-        print(f"  {colored('Error:', 'RED')} One of --dir, --file, or --probely is required", file=sys.stderr)
+    if not args.dir and not args.file and not args.probely and not args.findings_json:
+        print(f"  {colored('Error:', 'RED')} One of --dir, --file, --probely or --findings-json is required", file=sys.stderr)
         sys.exit(1)
+
+    structured = None
+    if args.findings_json:
+        if args.dir or args.file or args.probely or not args.scanner:
+            print(f"  {colored('Error:', 'RED')} --findings-json needs --scanner and cannot be combined with "
+                  f"--dir, --file or --probely", file=sys.stderr)
+            sys.exit(1)
+        try:
+            structured = load_findings_json(args.findings_json)
+        except ValueError as e:
+            print(f"  {colored('Error:', 'RED')} --findings-json: {e}", file=sys.stderr)
+            sys.exit(1)
 
     if args.app_id is None and not args.create_app:
         print(f"  {colored('Error:', 'RED')} Either --app-id or --create-app is required", file=sys.stderr)
@@ -2570,8 +2625,9 @@ def main():
     state_root: Path | None = None
     findings_dirs: list[Path] = []
 
-    if args.file:
-        md_files = [Path(args.file)]
+    if args.file or args.findings_json:
+        # --findings-json takes the one-file path; its list replaces extraction below.
+        md_files = [Path(args.file or args.findings_json)]
     else:
         state_root = Path(args.dir).resolve()
         if not state_root.is_dir():
@@ -2719,7 +2775,8 @@ def main():
         # Single-call path (only one file present).
         combined = file_parts[0][1]
         try:
-            mapping = extract_file(combined, file_parts[0][2], "Extracting findings...")
+            mapping = ({"findings": structured} if structured is not None
+                       else extract_file(combined, file_parts[0][2], "Extracting findings..."))
         except LLMCallError as e:
             print(f"  {colored('✗', 'RED')} {e}", file=sys.stderr)
             sys.exit(1)

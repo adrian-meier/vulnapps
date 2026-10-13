@@ -7,6 +7,7 @@ importer-side defense-in-depth added alongside that fix.
 
 import importlib.util
 import json
+import re
 
 import pytest
 import pathlib
@@ -703,3 +704,85 @@ def test_withdrawn_for_low_impact_is_still_mapped_not_fp():
     prompt = import_scan.SYSTEM_PROMPT_MAP
     assert "withdrawn from the confirmed count" in prompt
     assert "a severity cut-off does not" in prompt
+
+
+# ── --findings-json: phase 1 built in code from structured scanner output ──
+
+def _write_findings(tmp_path, data):
+    p = tmp_path / "findings.json"
+    p.write_text(data if isinstance(data, str) else json.dumps(data))
+    return str(p)
+
+
+@pytest.mark.parametrize("data, problem", [
+    ("[{", "cannot read"),
+    ({"findings": []}, "want a JSON list"),
+    (["x"], "finding 0: want an object"),
+    ([{"title": "t", "cwe": "CWE-89"}], "unknown field(s) ['cwe']"),
+    ([{"vuln_type": "XSS", "title": " "}], "title is required"),
+    ([{"title": "t", "severity": "High"}], "severity 'High'"),
+    ([{"title": "t", "poc": 3}], "poc must be a string"),
+    ([{"title": "t", "is_false_positive": "no"}], "is_false_positive must be"),
+])
+def test_findings_json_refuses_bad_input(tmp_path, data, problem):
+    with pytest.raises(ValueError, match=re.escape(problem)):
+        import_scan.load_findings_json(_write_findings(tmp_path, data))
+
+
+def test_findings_json_fields_are_what_the_extraction_prompt_returns():
+    shape = json.loads(import_scan.SYSTEM_PROMPT_EXTRACT.split("this exact format:\n", 1)[1]
+                       .replace(" or null", ""))
+    assert set(import_scan.FINDING_STR_FIELDS) | {"is_false_positive"} == set(shape["findings"][0])
+
+
+def test_scan_config_records_structured_extraction():
+    class A:
+        use_cli = False; extract_model = None; map_model = "claude-opus-5"; findings_json = "f.json"
+        model_version = reasoning_effort = harness_version = token_budget = seed = run_group = trial_index = None
+    cfg = import_scan._scan_config(A(), None)
+    assert cfg["extractor_version"] == "structured"
+    assert cfg["extractor_prompt_sha256"] is None
+
+
+class _StubVulnapps:
+    def __init__(self, *a, **k):
+        pass
+
+    def get_app(self, app_id):
+        return {"app": {"name": "T", "version": "1"}}
+
+    def get_vulns(self, app_id):
+        return [{"id": 7, "vuln_id": "TP-001", "title": "SQLi", "vuln_type": "SQLi", "severity": "high"}]
+
+    def get_chains(self, app_id):
+        return []
+
+    def submit_scan(self, *a, **k):
+        raise AssertionError("dry run must not submit")
+
+
+def test_findings_json_dry_run_maps_every_finding_without_extraction(tmp_path, monkeypatch, capsys):
+    data = [{"title": f"finding {i}", "vuln_type": "SQLi" if i == 0 else "XSS", "severity": "low",
+             "is_false_positive": False} for i in range(23)]
+
+    def no_extract(*a, **k):
+        raise AssertionError("--findings-json must not call the extraction LLM")
+
+    def stub_map(batch, *a, **k):
+        return {"mappings": [{"index": i, "matched_vuln_db_id": 7 if f["vuln_type"] == "SQLi" else None,
+                              "reasoning": "stub"} for i, f in batch]}, {}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test")
+    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
+    monkeypatch.setattr(import_scan, "VulnappsClient", _StubVulnapps)
+    monkeypatch.setattr(import_scan, "create_anthropic_client", lambda *a: object())
+    monkeypatch.setattr(import_scan, "run_extract", no_extract)
+    monkeypatch.setattr(import_scan, "run_map", stub_map)
+    monkeypatch.setattr(import_scan.sys, "argv", [
+        "import_scan.py", "--url", "http://x", "--api-key", "k", "--app-id", "1",
+        "--findings-json", _write_findings(tmp_path, data), "--scanner", "JSONL Scanner",
+        "--dry-run", "--format", "json"])
+    import_scan.main()
+    out = json.loads(capsys.readouterr().out)
+    assert [f["title"] for f in out["findings"]] == [f["title"] for f in data]
+    assert out["scanner_name"] == "JSONL Scanner"
+    assert out["findings"][0]["catalog_ids"] == ["TP-001"]
