@@ -786,3 +786,51 @@ def test_findings_json_dry_run_maps_every_finding_without_extraction(tmp_path, m
     assert [f["title"] for f in out["findings"]] == [f["title"] for f in data]
     assert out["scanner_name"] == "JSONL Scanner"
     assert out["findings"][0]["catalog_ids"] == ["TP-001"]
+
+
+def _map_batch(captured, reply, findings, batch):
+    return import_scan.run_map(batch, [_JWT_NONE_ALG_VULN], None, model="claude-opus-5",
+                               client=_fake_client(captured, reply), use_cli=False, provider="vertex",
+                               extra_info=None, spinner_msg="x")
+
+
+def test_short_last_batch_is_pinned_to_its_own_numbers():
+    """Taiga rep 1 (66 findings): the last batch, 60..65, came back numbered
+    0..5 on every try. The schema now only allows 60..65 and the prompt
+    names them."""
+    findings = [dict(_FINDING, title=f"F{i}") for i in range(66)]
+    batch = list(enumerate(findings))[60:]
+    captured = []
+    reply = json.dumps({"mappings": [{"index": i, "matched_vuln_db_id": None} for i in range(60, 66)]})
+    response, _ = _map_batch(captured, reply, findings, batch)
+    schema = captured[0]["output_config"]["format"]["schema"]
+    assert schema["properties"]["mappings"]["items"]["properties"]["index"]["enum"] == list(range(60, 66))
+    assert "60 to 65" in captured[0]["messages"][0]["content"]
+    import_scan.merge_mappings(findings, batch, response)
+    assert all("matched_vuln_db_id" in f for f in findings[60:])
+
+
+def test_relative_numbering_still_fails_loudly():
+    """No silent renumbering: an answer with 0..5 for findings 60..65 is
+    refused, never applied to findings 0..5."""
+    findings = [dict(_FINDING, title=f"F{i}") for i in range(66)]
+    batch = list(enumerate(findings))[60:]
+    with pytest.raises(import_scan.MappingMismatch, match=r"missing \[60, 61, 62, 63, 64, 65\]"):
+        import_scan.merge_mappings(findings, batch, {"mappings": [{"index": i} for i in range(6)]})
+    assert not any("matched_vuln_db_id" in f for f in findings)
+
+
+def test_raw_control_characters_in_reasoning_are_accepted():
+    """django-helpdesk rep 1 (55 findings): the last batch failed twice with
+    'Invalid control character' -- a raw newline inside a reasoning string."""
+    findings = [dict(_FINDING), dict(_FINDING, title="B")]
+    reply = ('{"mappings": [{"index": 0, "matched_vuln_db_id": 42, "reasoning": "line one\nline two\tend"},'
+             ' {"index": 1, "matched_vuln_db_id": null, "reasoning": "none"}]}')
+    response, _ = _map_batch([], reply, findings, list(enumerate(findings)))
+    import_scan.merge_mappings(findings, list(enumerate(findings)), response)
+    assert findings[0]["reasoning"] == "line one\nline two\tend"
+
+
+def test_truly_broken_json_still_raises():
+    with pytest.raises(json.JSONDecodeError):
+        _map_batch([], '{"mappings": [{"index": 0,}', [dict(_FINDING)], [(0, dict(_FINDING))])

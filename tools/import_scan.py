@@ -625,13 +625,38 @@ def _build_map_message(findings: list[dict], vulns: list, chains: list | None,
             "severity", "description", "poc", "code_location")
     numbered = [{"index": i, **{k: f.get(k) for k in keep if f.get(k)}}
                 for i, f in findings]
+    indices = [i for i, _ in findings]
     return f"""## Known Vulnerabilities for this Application
 
 {format_vulns_for_prompt(vulns)}{chains_section}
 
 {_extra_section(extra_info)}## Findings To Map
 
+Return exactly one mapping per finding, with `index` copied from the finding \
+as given: {indices[0]} to {indices[-1]}. Do not renumber them from 0.
+
 {json.dumps(numbered, indent=1)}"""
+
+
+def map_schema(indices: list[int]) -> dict:
+    """Structured-output schema for one mapping batch. `index` may only take
+    the batch's own finding numbers, so the answer cannot be renumbered
+    (e.g. 0..5 for findings 60..65). Missing or duplicated entries are still
+    possible and are caught by merge_mappings."""
+    ids = {"type": "array", "items": {"type": "integer"}}
+    entry = {"type": "object", "additionalProperties": False, "properties": {
+        "index": {"type": "integer", "enum": indices},
+        "matched_vuln_db_id": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "matched_chain_db_id": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "additional_vuln_db_ids": ids,
+        "is_chain": {"type": "boolean"},
+        "is_false_positive": {"type": "boolean"},
+        "fp_group": {"type": "string"},
+        "reasoning": {"type": "string"},
+    }}
+    entry["required"] = list(entry["properties"])
+    return {"type": "object", "additionalProperties": False, "required": ["mappings"],
+            "properties": {"mappings": {"type": "array", "items": entry}}}
 
 
 def _enforce_chain_flag(result: dict) -> None:
@@ -764,7 +789,8 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
 def _llm_json_api(system: str, user_message: str, model: str, client,
-                  spinner_msg: str, provider: str = "anthropic") -> tuple[dict, dict]:
+                  spinner_msg: str, provider: str = "anthropic",
+                  schema: dict | None = None) -> tuple[dict, dict]:
     """One streamed Messages API call returning (parsed JSON, usage).
 
     Streamed because a non-streaming call holds one socket with no bytes
@@ -774,6 +800,8 @@ def _llm_json_api(system: str, user_message: str, model: str, client,
     """
     kwargs = dict(model=model, max_tokens=MAX_OUTPUT_TOKENS, system=system,
                   messages=[{"role": "user", "content": user_message}])
+    if schema:
+        kwargs["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
     use_fallbacks = provider == "anthropic" and model in FALLBACK_MODELS
     with Spinner(spinner_msg):
         if use_fallbacks:
@@ -791,7 +819,8 @@ def _llm_json_api(system: str, user_message: str, model: str, client,
         usage = {"input": (u.input_tokens or 0) + (getattr(u, "cache_read_input_tokens", 0) or 0)
                           + (getattr(u, "cache_creation_input_tokens", 0) or 0),
                  "output": u.output_tokens or 0}
-    return json.loads(_extract_json_text(text)), usage
+    # strict=False: models write raw newlines/tabs inside long strings.
+    return json.loads(_extract_json_text(text), strict=False), usage
 
 
 def _llm_json_cli(system: str, user_message: str, model: str | None, spinner_msg: str) -> tuple[dict, dict]:
@@ -834,9 +863,9 @@ Respond with ONLY valid JSON (no markdown fencing)."""
     try:
         cli_output = json.loads(result.stdout)
         text = cli_output.get("result", result.stdout) if isinstance(cli_output, dict) else result.stdout
-        parsed = json.loads(_extract_json_text(text)) if isinstance(text, str) else text
+        parsed = json.loads(_extract_json_text(text), strict=False) if isinstance(text, str) else text
     except (json.JSONDecodeError, KeyError):
-        parsed = json.loads(_extract_json_text(result.stdout))
+        parsed = json.loads(_extract_json_text(result.stdout), strict=False)
     return parsed, {}
 
 
@@ -856,7 +885,8 @@ def run_map(batch: list[tuple[int, dict]], vulns: list, chains: list | None, *, 
     msg = _build_map_message(batch, vulns, chains, extra_info)
     if use_cli:
         return _llm_json_cli(SYSTEM_PROMPT_MAP, msg, model, spinner_msg)
-    return _llm_json_api(SYSTEM_PROMPT_MAP, msg, model, client, spinner_msg, provider)
+    return _llm_json_api(SYSTEM_PROMPT_MAP, msg, model, client, spinner_msg, provider,
+                         schema=map_schema([i for i, _ in batch]))
 
 
 # The only fields phase 2 may set on a finding. Everything else -- title,
